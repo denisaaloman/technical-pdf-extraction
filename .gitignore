@@ -1,0 +1,33 @@
+# Secrete / config locala
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+
+# Medii virtuale
+venv/
+.venv/
+env/
+ENV/
+
+# Cache-uri unelte
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Fisiere temporare / output local de test
+*.log
