@@ -4,11 +4,127 @@ import re
 import time
 from typing import Any, Dict, List
 
-import fitz #PyMuPDF
+import fitz  # PyMuPDF
 from groq import Groq
 
 MIN_TABLE_COLUMNS = 2
 MIN_DATA_ROWS = 1
+
+
+TOC_TITLE_PATTERNS = [
+    r"\bcuprins\b",
+    r"\btable of contents\b",
+    r"\bcontents\b",
+    r"\bsommaire\b",
+    r"\bindice\b",
+    r"\binhaltsverzeichnis\b",
+]
+
+TOC_HEADER_KEYWORDS = {"pagina", "pag.", "page", "pag"}
+
+# Regex pentru detectarea unităților de măsură tehnice (folosit pentru a diferenția un tabel tehnic de un Cuprins)
+TECHNICAL_UNITS_PATTERN = re.compile(
+    r'\b(?:kW|kVAR|kVA|kV|mA|A|V|Hz|mm2|mm|m\b|buc|kg|W|Ohm|÷|\+)\b',
+    re.IGNORECASE
+)
+
+
+def is_toc(title: str, headers: List[str], rows: List[Dict[str, str]] | None = None) -> bool:
+    title_lower = title.lower().strip()
+
+    # 1) Titlul spune explicit „Cuprins"
+    if any(re.search(pat, title_lower) for pat in TOC_TITLE_PATTERNS):
+        return True
+
+    # 2) Header-ele conțin „Pagina"/„Page" ȘI celălalt header e un nume de capitol
+    headers_lower = [h.lower().strip() for h in headers]
+    has_page_header = any(
+        any(kw in h for kw in TOC_HEADER_KEYWORDS) for h in headers_lower
+    )
+    if has_page_header and len(headers) <= 3:
+        if rows:
+            page_col = None
+            for h in headers:
+                if any(kw in h.lower() for kw in TOC_HEADER_KEYWORDS):
+                    page_col = h
+                    break
+            if page_col:
+                numeric_count = sum(
+                    1 for r in rows
+                    if re.fullmatch(r"\s*\d+\s*", str(r.get(page_col, "")))
+                )
+                if len(rows) > 0 and numeric_count / len(rows) >= 0.8:
+                    return True
+
+    return False
+
+def looks_like_toc_content(headers: List[str], rows: List[Dict[str, str]]) -> bool:
+    """
+    Analizeaza structura randurilor pentru a determina daca e un Cuprins (TOC)
+    sau o lista de capitole, fara a tine cont de titlu.
+
+    Functioneaza in doua moduri:
+    A) Tabel cu coloana de pagina explicita (Pagina / Page / Pag.)
+    B) Lista simpla "Nr. + Descriere" fara coloana de pagina, unde
+       descrierea e chiar un nume de capitol/anexa (eventual cu
+       "(N file)" la final) - cazul CUPRINS-ului tau.
+    """
+    if not rows or not headers:
+        return False
+
+    all_text = ""
+    for r in rows:
+        for h in headers:
+            all_text += str(r.get(h, "")) + " "
+
+    # Daca textul contine unitati de masura tehnice (kW, A, mm), e tabel real, nu TOC
+    if TECHNICAL_UNITS_PATTERN.search(all_text):
+        return False
+
+    # --- Mod A: cautam o coloana de pagina numerica ---
+    potential_page_col = None
+    for h in headers:
+        numeric_values = []
+        for r in rows:
+            val = str(r.get(h, "")).strip()
+            if re.fullmatch(r"\d+(\.\d+)*", val):
+                numeric_values.append(val)
+        if len(numeric_values) / len(rows) >= 0.8:
+            potential_page_col = h
+            break
+
+    other_cols = [h for h in headers if h != potential_page_col] if potential_page_col else headers
+
+    # --- Mod B (fara coloana de pagina): text = nume capitol/anexa ---
+    CHAPTER_LABEL_KEYWORDS = re.compile(
+        r"\b(anexa|schema|capitol|cuprins|caiet de sarcini|memoriu|listă|lista)\b",
+        re.IGNORECASE,
+    )
+    TRAILING_FILE_COUNT = re.compile(r"\(\s*\d+\s*fil[ae]\s*\)\s*$", re.IGNORECASE)
+
+    chapter_pattern_count = 0
+    keyword_hit_count = 0
+    for r in rows:
+        for h in other_cols:
+            val = str(r.get(h, "")).strip()
+            if not val:
+                continue
+            if re.match(r"^\s*(\d+(\.\d+)*\.?|[A-Z]\.)\s", val):
+                chapter_pattern_count += 1
+            if CHAPTER_LABEL_KEYWORDS.search(val) or TRAILING_FILE_COUNT.search(val):
+                keyword_hit_count += 1
+
+    if len(rows) > 0 and (chapter_pattern_count / len(rows) >= 0.5 or keyword_hit_count / len(rows) >= 0.5):
+        return True
+
+    if potential_page_col and not other_cols:
+        return True
+
+    if re.search(r'\.{3,}|\…{2,}', all_text):
+        return True
+
+    return False
+
 TITLE_BLOCK_KEYWORDS = [
     "intocmit", "întocmit",
     "verificat",
@@ -41,7 +157,23 @@ in two shapes:
    items are instead generic descriptive statements, procedures, safety
    conditions, protecții descriptions, operating-mode explanations, or
    narrative about how a system functions - with no such per-item
-   identifiers — it is NOT an itemized list; skip it, it's prose.
+   identifiers — it is NOT an itemized list; skip it, it is prose.
+
+   This applies regardless of the numbering style used (1,2,3 / a,b,c /
+   1.1,1.2 / roman numerals / no numbering at all). Do not rely on the
+   shape of the numbers to decide - use this content test instead: read
+   each item on its own, ignoring everything else on the page. Does it
+   read as a complete, self-contained technical fact or deliverable
+   (something you could hand to a supplier as-is)? Or does it read as a
+   section/chapter/subsection TITLE - a short label that announces or
+   introduces content that follows it (whether that content is prose
+   right below it, on a later page, or simply implied)? A title fails
+   this test even if it happens to start with a number: it is naming a
+   topic, not stating a fact about equipment. If most items on the page
+   are titles in this sense, this is document structure (like a table of
+   contents or a set of chapter/subsection headers) - it is NOT a
+   itemized list, skip it entirely, even if it looks superficially like
+   one (short numbered lines stacked vertically).
 
 For each genuine table or list, return:
 - "kind": "grid" or "list" (per the two shapes above).
@@ -66,6 +198,11 @@ Do NOT include:
 - Signature blocks, letterheads, stamps, or approval sections.
 - Numbered/bulleted lists that fail the itemized-list test above (no
   per-item project-specific technical identifier).
+- Table of contents / "Cuprins" pages, i.e. any list whose entries are
+  document section names, chapter names, or heading titles paired mainly
+  with page numbers. These are structural navigation aids, not technical
+  data, even if they look like a two-column list (name + number) - skip
+  them entirely regardless of how many entries they have.
 
 A genuine grid needs at least {min_cols} columns AND at least
 {min_rows} rows of short, structured data values below the header. A
@@ -137,10 +274,32 @@ structure:
 Rules:
 - Use the header names above as keys, exactly as written.
 - Preserve every cell value exactly as written (including diacritics).
-- In this kind of technical
-  table, '+' is by far the more common symbol in these identifiers/ranges -
-  '÷' is rare. So if the printed glyph is visually ambiguous or unclear
-  between '+' and '÷', prefer reading it as '+'.
+- This document uses '+' to separate values in a range or list (e.g. "10+16"
+meaning "10 to 16"). Always transcribe this separator as '+', even if the
+printed glyph looks like '÷'. Do not use '÷' anywhere in your output.
+- VERTICALLY MERGED CELLS :
+  a value is printed ONCE in a tall cell that visually spans multiple
+  rows below it — no text is repeated on those rows, no "Idem" is
+  written, the cell just has a tall border. TREAT IT AS IF the same
+  value were printed on every row it spans. Fill in the same value for
+  every covered row, not just the first.
+
+  Example — what you see in the table:
+    | Tip aparat     | Tensiune | Consum   |
+    | Tablou electric| 400V     |          |  <-- "Tablou electric" + "400V" are in TALL merged cells
+    |                |          | 48 kW    |
+    |                |          | 22 kW    |
+    |                |          | 15 kW    |
+    | Separator      | 230V     | 5 kW     |  <-- new merge group starts here
+
+  What you must return (same value repeated on every covered row):
+    {{"Tip aparat": "Tablou electric", "Tensiune": "400V", "Consum": "48 kW"}},
+    {{"Tip aparat": "Tablou electric", "Tensiune": "400V", "Consum": "22 kW"}},
+    {{"Tip aparat": "Tablou electric", "Tensiune": "400V", "Consum": "15 kW"}},
+    {{"Tip aparat": "Separator",        "Tensiune": "230V", "Consum": "5 kW"}},
+
+  Detect merges from the table's BORDER LAYOUT (tall cells with no inner
+  horizontal lines), not from any text repetition.
 - If a cell says "Idem" (meaning "same as row above"), replace it with the
   full value copied from the most recent non-"Idem" cell in that column.
 - Omit a key only if that specific cell is completely empty.
@@ -249,7 +408,6 @@ def render_pdf_pages(pdf_bytes: bytes, scale: float = 3.0):
 
 
 def is_section_label_row(headers: List[str], row: Dict[str, str], identifier_headers: List[str] | None = None):
-
     if "Secțiune" in row and row.get("Secțiune"):
         return False
 
@@ -271,12 +429,14 @@ def extract_tables_from_page(page_image: bytes, api_key: str, model: str = "meta
     client = Groq(api_key=api_key)
     data_url = buffer_to_data_url(page_image)
 
-    detect_raw = vision_completion(client, model, data_url, TABLES_DETECT_PROMPT, 1024)
+    detect_raw = vision_completion(client, model, data_url, TABLES_DETECT_PROMPT, 3072)
     try:
         parsed = extract_json(detect_raw)
         detected = parsed.get("tables", []) if isinstance(parsed, dict) else []
     except Exception:
+        print(f"[detect_json_parse_failed] raw response was:\n{detect_raw[:2000]}")
         return []
+
 
     candidates = [
         t
@@ -284,9 +444,8 @@ def extract_tables_from_page(page_image: bytes, api_key: str, model: str = "meta
         if isinstance(t.get("headers"), list)
            and len([h for h in t["headers"] if h and h.strip()]) >= MIN_TABLE_COLUMNS
            and (t.get("estimated_data_rows") or 0) >= MIN_DATA_ROWS
-           and not is_title_block(
-            t.get("title") or "", [h for h in t["headers"] if h and h.strip()]
-        )
+           and not is_title_block(t.get("title") or "", [h for h in t["headers"] if h and h.strip()])
+           and not is_toc(t.get("title") or "", [h for h in t["headers"] if h and h.strip()])
     ]
 
     results: List[Dict[str, Any]] = []
@@ -301,8 +460,11 @@ def extract_tables_from_page(page_image: bytes, api_key: str, model: str = "meta
             try:
                 parsed = extract_json(rows_raw)
                 rows = parsed.get("rows", []) if isinstance(parsed, dict) else []
+
             except Exception:
                 continue
+
+            print(f"  [rows for {title!r}]: count={len(rows)}, first={rows[0] if rows else None}")
 
             OBS_KEY = "Observații"
             clean_rows = []
@@ -320,7 +482,13 @@ def extract_tables_from_page(page_image: bytes, api_key: str, model: str = "meta
                     continue
                 clean_rows.append(coerced)
 
-            if len(clean_rows) >= MIN_DATA_ROWS and not is_title_block(title, ["Nr.", "Descriere"]):
+
+
+            if len(clean_rows) >= MIN_DATA_ROWS and not is_title_block(title, ["Nr.", "Descriere"]) and not is_toc(
+                    title, ["Nr.", "Descriere"]):
+                if looks_like_toc_content(["Nr.", "Descriere"], clean_rows):
+                    print(f"Skipping TOC-like list: {title}")
+                    continue
                 has_obs = any(OBS_KEY in r for r in clean_rows)
                 final_headers = ["Nr.", "Descriere"] + ([OBS_KEY] if has_obs else [])
                 results.append({"title": title, "headers": final_headers, "rows": clean_rows, "kind": kind})
@@ -357,15 +525,10 @@ def extract_tables_from_page(page_image: bytes, api_key: str, model: str = "meta
                 if section_str:
                     current_section = section_str
 
-
             if is_section_label_row(headers, coerced, identifier_headers):
-                #construieste eticheta de sectiune din valorile existente
                 non_empty = [v for v in coerced.values() if v]
                 if non_empty:
-                    if not current_section:
-                        current_section = " - ".join(non_empty)
-                    else:
-                        pass
+                    current_section = " - ".join(non_empty)
                 continue
 
             if current_section and SECTION_KEY not in r:
@@ -374,16 +537,22 @@ def extract_tables_from_page(page_image: bytes, api_key: str, model: str = "meta
             if SECTION_KEY in r and r.get(SECTION_KEY):
                 coerced[SECTION_KEY] = str(r.get(SECTION_KEY)).strip()
 
-
             if not any(v for v in coerced.values()):
                 continue
 
             clean_rows.append(coerced)
 
+
         #only for grids
         all_values = [v for r in clean_rows for v in r.values() if v]
         long_value_count = sum(1 for v in all_values if len(v) > 80)
         looks_like_prose = len(all_values) > 0 and (long_value_count / len(all_values)) > 0.4
+
+
+        if looks_like_toc_content(headers, clean_rows):
+            print(f"Skipping TOC-like table: {title}")
+            continue
+
 
         if (len(clean_rows) >= MIN_DATA_ROWS and not looks_like_prose and not is_title_block(title, headers)):
             has_section = any(SECTION_KEY in r for r in clean_rows)
