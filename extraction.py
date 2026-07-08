@@ -22,7 +22,6 @@ TOC_TITLE_PATTERNS = [
 
 TOC_HEADER_KEYWORDS = {"pagina", "pag.", "page", "pag"}
 
-# Regex pentru detectarea unităților de măsură tehnice (folosit pentru a diferenția un tabel tehnic de un Cuprins)
 TECHNICAL_UNITS_PATTERN = re.compile(
     r'\b(?:kW|kVAR|kVA|kV|mA|A|V|Hz|mm2|mm|m\b|buc|kg|W|Ohm|÷|\+)\b',
     re.IGNORECASE
@@ -32,11 +31,10 @@ TECHNICAL_UNITS_PATTERN = re.compile(
 def is_toc(title: str, headers: List[str], rows: List[Dict[str, str]] | None = None) -> bool:
     title_lower = title.lower().strip()
 
-    # 1) Titlul spune explicit „Cuprins"
+
     if any(re.search(pat, title_lower) for pat in TOC_TITLE_PATTERNS):
         return True
 
-    # 2) Header-ele conțin „Pagina"/„Page" ȘI celălalt header e un nume de capitol
     headers_lower = [h.lower().strip() for h in headers]
     has_page_header = any(
         any(kw in h for kw in TOC_HEADER_KEYWORDS) for h in headers_lower
@@ -60,14 +58,11 @@ def is_toc(title: str, headers: List[str], rows: List[Dict[str, str]] | None = N
 
 def looks_like_toc_content(headers: List[str], rows: List[Dict[str, str]]) -> bool:
     """
-    Analizeaza structura randurilor pentru a determina daca e un Cuprins (TOC)
-    sau o lista de capitole, fara a tine cont de titlu.
-
+    Analizeaza structura randurilor pentru a determina daca e un Cuprins
     Functioneaza in doua moduri:
     A) Tabel cu coloana de pagina explicita (Pagina / Page / Pag.)
     B) Lista simpla "Nr. + Descriere" fara coloana de pagina, unde
-       descrierea e chiar un nume de capitol/anexa (eventual cu
-       "(N file)" la final) - cazul CUPRINS-ului tau.
+       descrierea e chiar un nume de capitol/anexa.
     """
     if not rows or not headers:
         return False
@@ -77,11 +72,11 @@ def looks_like_toc_content(headers: List[str], rows: List[Dict[str, str]]) -> bo
         for h in headers:
             all_text += str(r.get(h, "")) + " "
 
-    # Daca textul contine unitati de masura tehnice (kW, A, mm), e tabel real, nu TOC
+    #textul contine unitati de masura tehnice e tabel real
     if TECHNICAL_UNITS_PATTERN.search(all_text):
         return False
 
-    # --- Mod A: cautam o coloana de pagina numerica ---
+    #A. cautam o coloana de pagina numerica
     potential_page_col = None
     for h in headers:
         numeric_values = []
@@ -95,7 +90,7 @@ def looks_like_toc_content(headers: List[str], rows: List[Dict[str, str]]) -> bo
 
     other_cols = [h for h in headers if h != potential_page_col] if potential_page_col else headers
 
-    # --- Mod B (fara coloana de pagina): text = nume capitol/anexa ---
+    #text = nume capitol
     CHAPTER_LABEL_KEYWORDS = re.compile(
         r"\b(anexa|schema|capitol|cuprins|caiet de sarcini|memoriu|listă|lista)\b",
         re.IGNORECASE,
