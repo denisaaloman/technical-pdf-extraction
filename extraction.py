@@ -10,6 +10,8 @@ from groq import Groq
 MIN_TABLE_COLUMNS = 2
 MIN_DATA_ROWS = 1
 
+IDEM_PATTERN = re.compile(r"^\s*idem\s*$", re.IGNORECASE)
+
 
 TOC_TITLE_PATTERNS = [
     r"\bcuprins\b",
@@ -92,7 +94,7 @@ def looks_like_toc_content(headers: List[str], rows: List[Dict[str, str]]) -> bo
 
     #text = nume capitol
     CHAPTER_LABEL_KEYWORDS = re.compile(
-        r"\b(anexa|schema|capitol|cuprins|caiet de sarcini|memoriu|listă|lista)\b",
+        r"\b(anexa\d*|schema|capitol|cuprins|caiet de sarcini|memoriu|listă|lista)\b",
         re.IGNORECASE,
     )
     TRAILING_FILE_COUNT = re.compile(r"\(\s*\d+\s*fil[ae]\s*\)\s*$", re.IGNORECASE)
@@ -132,76 +134,61 @@ TITLE_BLOCK_KEYWORDS = [
 
 TABLES_DETECT_PROMPT = """\
 This is a page from a technical document (could be in Romanian or English).
+Find every genuine piece of itemized TECHNICAL DATA. Two shapes:
 
-Find EVERY genuine piece of itemized TECHNICAL DATA on this page. This comes
-in two shapes:
+1. GRID tables - header row of column names, then rows of short values.
+2. ITEMIZED TECHNICAL LISTS - numbered/lettered list where each item names
+   a project-specific technical deliverable (equipment, tablou, installation)
+   and references a concrete identifier (equipment code, Annex reference,
+   quantity, rating in kW/kVAR/m/A).
 
-1. GRID tables - a header row of column names with short values organized
-   in rows and columns below it. Typical examples: equipment lists, cable
-   schedules, parts lists, technical characteristics tables
-   ("Antemăsurătoare", "Lista de motoare", "Lista de aparataj", etc.).
+For each, return:
+- "kind": "grid" or "list"
+- "title": the nearest section heading above this table/list, copied exactly,
+even if there is introductory prose text between the heading and the
+first data row. Use "" only if there is truly no heading anywhere above.
+- "headers": for "grid", column names left to right, copied exactly. For
+  "list", use ["Nr.", "Descriere"] (or the actual numbering label, e.g.
+  "Poz.", if visibly different).
+- "identifier_headers": the subset of "headers" (copied exactly) whose cells
+  hold labels/identifiers rather than measured values (row number, code,
+  name, description). For "list" tables this is just ["Nr."].
+- "estimated_data_rows": your best estimate of items/rows below the header.
 
-2. ITEMIZED TECHNICAL LISTS - a numbered or lettered list where each item,
-   even written as a full sentence, names a distinct technical deliverable
-   tied to this specific project: an equipment/tablou/installation to
-   supply or execute. The decisive test: does this item reference at least
-   one concrete project-specific technical identifier or value - an
-   equipment/tablou code (e.g. "TE402", "TGD"), an Annex/Anexa reference,
-   a quantity, or a rating (kW, kVAR, m of cable, A, etc.)? If yes for
-   (almost) every item, it's a genuine itemized list - extract it. If the
-   items are instead generic descriptive statements, procedures, safety
-   conditions, protecții descriptions, operating-mode explanations, or
-   narrative about how a system functions - with no such per-item
-   identifiers — it is NOT an itemized list; skip it, it is prose.
+Do NOT include: section headings, signature blocks/stamps, body text,
+table of contents / Cuprins pages (entries that are document section names
+paired with page numbers are structural navigation, not technical data).
 
-   This applies regardless of the numbering style used (1,2,3 / a,b,c /
-   1.1,1.2 / roman numerals / no numbering at all). Do not rely on the
-   shape of the numbers to decide - use this content test instead: read
-   each item on its own, ignoring everything else on the page. Does it
-   read as a complete, self-contained technical fact or deliverable
-   (something you could hand to a supplier as-is)? Or does it read as a
-   section/chapter/subsection TITLE - a short label that announces or
-   introduces content that follows it (whether that content is prose
-   right below it, on a later page, or simply implied)? A title fails
-   this test even if it happens to start with a number: it is naming a
-   topic, not stating a fact about equipment. If most items on the page
-   are titles in this sense, this is document structure (like a table of
-   contents or a set of chapter/subsection headers) - it is NOT a
-   itemized list, skip it entirely, even if it looks superficially like
-   one (short numbered lines stacked vertically).
+Also do NOT include the recurring page LETTERHEAD/title-block that appears
+at the top of nearly every page of this kind of document - a small table
+naming the designer firm ("Proiectant: ..."), the beneficiary/project name,
+the document type (e.g. "CAIET DE SARCINI"), and a page number ("Pag. X/Y"),
+often followed by an "Obiectiv:" row describing the project in one long
+sentence. This is administrative page framing, repeated identically (or
+nearly so) across pages - never technical data, regardless of how
+table-like its borders look.
 
-For each genuine table or list, return:
-- "kind": "grid" or "list" (per the two shapes above).
-- "title": the heading text printed directly above it, copied exactly
-  (preserve diacritics/casing). Use "" if there is truly no heading above it.
-- "headers": for "grid", the column header names left to right, copied
-  exactly. For "list", use ["Nr.", "Descriere"] (or the actual numbering
-  label used, e.g. "Poz.", if visibly different from "Nr.").
-- "identifier_headers": the subset of "headers" (copied exactly, same
-  spelling) whose cells hold labels/identifiers rather than measured
-  values - e.g. a row number, code, name, or description column. Judge
-  this per table, based on what that specific column actually contains
-  in THIS document (a "Denumire"/"Descriere" column counts as identifier
-  only if it never holds a numeric measurement). Every other header in
-  "headers" is implicitly a data/measurement column. For "list" tables,
-  this is just the numbering column (e.g. ["Nr."]).
-- "estimated_data_rows": your best estimate of how many actual items/rows
-  (excluding the header) appear on this page.
+Also do NOT include reference lists of LEGAL NORMS OR STANDARDS - e.g. a
+checklist (✓ or bullet) citing standard/norm codes such as "I7 - 2002",
+"SR EN 60439-1", "PE 116/94", "I20 - 2000", "STAS ...", "ISO ...", "IEC ..."
+followed by the title of that norm. These codes look like identifiers but
+are NOT project-specific technical deliverables - they're citations of
+legislation/standards the project must comply with. Skip this kind of list
+entirely, even if it's numbered or bulleted and even if the codes contain
+digits, exactly like an equipment code would.
 
-Do NOT include:
-- Section headings, chapter titles, or a title followed by ordinary body text.
-- Signature blocks, letterheads, stamps, or approval sections.
-- Numbered/bulleted lists that fail the itemized-list test above (no
-  per-item project-specific technical identifier).
-- Table of contents / "Cuprins" pages, i.e. any list whose entries are
-  document section names, chapter names, or heading titles paired mainly
-  with page numbers. These are structural navigation aids, not technical
-  data, even if they look like a two-column list (name + number) - skip
-  them entirely regardless of how many entries they have.
+By contrast, DO include a bulleted/arrow list (e.g. using ">", "-", or no
+marker at all) where each item names a project equipment/tablou by its own
+code followed by an installed rating, such as:
+  > TE402 - Siloz de grâu și precurățare .... 48 kW
+  > TE403 și TFC modificat și completat ... 121 kW
+This is a genuine itemized technical list (equipment code + kW rating per
+item) even though it's short and has no visible numbering - extract it as
+kind "list".
 
-A genuine grid needs at least {min_cols} columns AND at least
-{min_rows} rows of short, structured data values below the header. A
-genuine itemized list needs at least {min_rows} qualifying items.
+A genuine grid needs at least {min_cols} columns and at least {min_rows}
+rows of short, structured data values below the header. A genuine itemized
+list needs at least {min_rows} qualifying items.
 
 Return ONLY valid JSON, no markdown fences, no commentary:
 {{"tables": [{{"kind": "grid", "title": "EXACT HEADING", "headers": ["Col 1", "Col 2"], "identifier_headers": ["Col 1"], "estimated_data_rows": 5}}]}}
@@ -270,33 +257,40 @@ Rules:
 - Use the header names above as keys, exactly as written.
 - Preserve every cell value exactly as written (including diacritics).
 - This document uses '+' to separate values in a range or list (e.g. "10+16"
-meaning "10 to 16"). Always transcribe this separator as '+', even if the
-printed glyph looks like '÷'. Do not use '÷' anywhere in your output.
-- VERTICALLY MERGED CELLS :
-  a value is printed ONCE in a tall cell that visually spans multiple
-  rows below it — no text is repeated on those rows, no "Idem" is
-  written, the cell just has a tall border. TREAT IT AS IF the same
-  value were printed on every row it spans. Fill in the same value for
-  every covered row, not just the first.
+  meaning "10 to 16"). Always transcribe this separator as '+', even if the
+  printed glyph looks like '÷'. Do not use '÷' anywhere in your output.
+- "Idem" handling: a cell that says "Idem" means "same as the cell above
+  in the same column". Replace it with the FULL value copied from the most
+  recent non-"Idem" cell in that column. Do not leave "Idem" as-is.
 
-  Example — what you see in the table:
-    | Tip aparat     | Tensiune | Consum   |
-    | Tablou electric| 400V     |          |  <-- "Tablou electric" + "400V" are in TALL merged cells
-    |                |          | 48 kW    |
-    |                |          | 22 kW    |
-    |                |          | 15 kW    |
-    | Separator      | 230V     | 5 kW     |  <-- new merge group starts here
+  Example - what you see in the table:
+    | 1 | Întrerupător automat tripolar, protecţie motorare | 0,68kW (1,3 - 2A) | Buc. | 2 |
+    | 2 | Idem                                              | 1,5kW (2,5 - 4A)   | Buc. | 5 |
+    | 3 | Idem                                              | 5,5kW (9 - 12A)    | Buc. | 2 |
 
-  What you must return (same value repeated on every covered row):
-    {{"Tip aparat": "Tablou electric", "Tensiune": "400V", "Consum": "48 kW"}},
-    {{"Tip aparat": "Tablou electric", "Tensiune": "400V", "Consum": "22 kW"}},
-    {{"Tip aparat": "Tablou electric", "Tensiune": "400V", "Consum": "15 kW"}},
-    {{"Tip aparat": "Separator",        "Tensiune": "230V", "Consum": "5 kW"}},
+  Example - what you must return (Idem replaced with the full value):
+    {{"Nr. Crt.": "1", "Denumire": "Întrerupător automat tripolar, protecţie motorare", "Caracteristici": "0,68kW (1,3 - 2A)", "UM": "Buc.", "Cantitate": "2"}},
+    {{"Nr. Crt.": "2", "Denumire": "Întrerupător automat tripolar, protecţie motorare", "Caracteristici": "1,5kW (2,5 - 4A)",   "UM": "Buc.", "Cantitate": "5"}},
+    {{"Nr. Crt.": "3", "Denumire": "Întrerupător automat tripolar, protecţie motorare", "Caracteristici": "5,5kW (9 - 12A)",    "UM": "Buc.", "Cantitate": "2"}},
+
+- VERTICALLY MERGED CELLS: a value is printed ONCE in a tall cell that
+  visually spans multiple rows below it - no text repeated on those
+  rows, no "Idem" written, the cell just has a tall border. TREAT IT AS
+  IF the same value were printed on every row it spans. Fill in the
+  same value for every covered row, not just the first.
+
+  Example - what you see in the table:
+    | 1 | 402TE → Motoare valturi | CYAbY-F 3x1,5 | m | 120 |
+    | 2 |                         | CYAbY-F 4x1,5 | m | 320 |
+    | 3 |                         | CYAbY-F 4x2,5 | m | 120 |
+
+  Example - what you must return (first column value REPEATED on every row):
+    {{"Nr. Crt.": "1", "Poziționare cablu": "402TE → Motoare valturi", "Tip / Secțiune": "CYAbY-F 3x1,5", "UM": "m", "Lungime estimativă": "120"}},
+    {{"Nr. Crt.": "2", "Poziționare cablu": "402TE → Motoare valturi", "Tip / Secțiune": "CYAbY-F 4x1,5", "UM": "m", "Lungime estimativă": "320"}},
+    {{"Nr. Crt.": "3", "Poziționare cablu": "402TE → Motoare valturi", "Tip / Secțiune": "CYAbY-F 4x2,5", "UM": "m", "Lungime estimativă": "120"}},
 
   Detect merges from the table's BORDER LAYOUT (tall cells with no inner
   horizontal lines), not from any text repetition.
-- If a cell says "Idem" (meaning "same as row above"), replace it with the
-  full value copied from the most recent non-"Idem" cell in that column.
 - Omit a key only if that specific cell is completely empty.
 - Do not skip any genuine data row (section-label rows are handled per the
   rule above, not skipped silently - their text must be attached forward).
@@ -326,12 +320,25 @@ def buffer_to_data_url(buf: bytes, mime: str = "image/png"):
     return f"data:{mime};base64,{b64}"
 
 
+def strip_diacritics(text: str) -> str:
+    pairs = [
+        ("ă", "a"), ("â", "a"), ("î", "i"),
+        ("ș", "s"), ("ş", "s"),
+        ("ț", "t"), ("ţ", "t"),
+        ("Ă", "A"), ("Â", "A"), ("Î", "I"),
+        ("Ș", "S"), ("Ş", "S"),
+        ("Ț", "T"), ("Ţ", "T"),
+    ]
+    table = str.maketrans({src: dst for src, dst in pairs})
+    return text.translate(table)
+
+
 def is_title_block(title: str, headers: List[str]):
     """Detecteaza deterministic un title-block/stampila, care structural poate arata ca un tabel
     mic dar nu contine date tehnice.
     """
-    joined = (title + " " + " ".join(headers)).lower()
-    hits = sum(1 for kw in TITLE_BLOCK_KEYWORDS if kw in joined)
+    joined = strip_diacritics((title + " " + " ".join(headers)).lower())
+    hits = sum(1 for kw in TITLE_BLOCK_KEYWORDS if strip_diacritics(kw) in joined)
     return hits >= 2
 
 
@@ -455,11 +462,15 @@ def extract_tables_from_page(page_image: bytes, api_key: str, model: str = "meta
             try:
                 parsed = extract_json(rows_raw)
                 rows = parsed.get("rows", []) if isinstance(parsed, dict) else []
+                # Imediat dupa ce primesti rows de la model, inainte de orice filtrare:
+                print(f"[RAW rows for {title!r}] count={len(rows)}")
+                for i, r in enumerate(rows):
+                    print(f"  raw[{i}]: {r}")
 
             except Exception:
                 continue
 
-            print(f"  [rows for {title!r}]: count={len(rows)}, first={rows[0] if rows else None}")
+
 
             OBS_KEY = "Observații"
             clean_rows = []
@@ -501,6 +512,10 @@ def extract_tables_from_page(page_image: bytes, api_key: str, model: str = "meta
         try:
             parsed = extract_json(rows_raw)
             rows = parsed.get("rows", []) if isinstance(parsed, dict) else []
+            # Imediat dupa ce primesti rows de la model, inainte de orice filtrare:
+            print(f"[RAW rows for {title!r}] count={len(rows)}")
+            for i, r in enumerate(rows):
+                print(f"  raw[{i}]: {r}")
         except Exception:
             continue
 
@@ -508,11 +523,21 @@ def extract_tables_from_page(page_image: bytes, api_key: str, model: str = "meta
         clean_rows: List[Dict[str, str]] = []
         current_section: str | None = None
 
+        last_seen = {}
         for r in rows:
+
             if not isinstance(r, dict):
                 continue
 
             coerced = {h: str(r.get(h, "")).strip() for h in headers}
+
+            # Rezolva "Idem" determinist - nu te baza doar pe model
+            for h in headers:
+                val = coerced.get(h, "")
+                if IDEM_PATTERN.match(val):
+                    coerced[h] = last_seen.get(h, val)
+                elif val:
+                    last_seen[h] = val
 
             section_value = r.get(SECTION_KEY) or r.get("Sectiune")
             if section_value:
