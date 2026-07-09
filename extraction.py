@@ -122,6 +122,7 @@ def looks_like_toc_content(headers: List[str], rows: List[Dict[str, str]]) -> bo
 
     return False
 
+
 TITLE_BLOCK_KEYWORDS = [
     "intocmit", "întocmit",
     "verificat",
@@ -153,6 +154,16 @@ first data row. Use "" only if there is truly no heading anywhere above.
 - "identifier_headers": the subset of "headers" (copied exactly) whose cells
   hold labels/identifiers rather than measured values (row number, code,
   name, description). For "list" tables this is just ["Nr."].
+- "category": classify the table/list itself before deciding anything else.
+  Return "ADMINISTRATIV" if the table's content is about identifying the
+  document, signatures/stamps, or data about the designers/beneficiary/
+  verifiers (e.g. firm name, project name, document type, page number,
+  "Intocmit"/"Verificat"/"Sef proiect"/"Proiectant"/"Beneficiar" rows,
+  revision info). Return "TEHNIC" if it describes objects, equipment,
+  installations, materials, or technical quantities. Only "TEHNIC" tables
+  should ever be returned in the final "tables" array below - if you decide
+  a table is "ADMINISTRATIV", leave it out of the array entirely rather
+  than including it with that label.
 - "estimated_data_rows": your best estimate of items/rows below the header.
 
 Do NOT include: section headings, signature blocks/stamps, body text,
@@ -166,7 +177,8 @@ the document type (e.g. "CAIET DE SARCINI"), and a page number ("Pag. X/Y"),
 often followed by an "Obiectiv:" row describing the project in one long
 sentence. This is administrative page framing, repeated identically (or
 nearly so) across pages - never technical data, regardless of how
-table-like its borders look.
+table-like its borders look. This is exactly the "ADMINISTRATIV" category
+described above - never include it, no matter where on the page it appears.
 
 Also do NOT include reference lists of LEGAL NORMS OR STANDARDS - e.g. a
 checklist (✓ or bullet) citing standard/norm codes such as "I7 - 2002",
@@ -177,6 +189,18 @@ legislation/standards the project must comply with. Skip this kind of list
 entirely, even if it's numbered or bulleted and even if the codes contain
 digits, exactly like an equipment code would.
 
+Also do NOT include prose SCOPE-OF-WORK bullet lists - e.g. a short intro
+sentence like "Se va asigura proiectarea și execuția următoarelor
+instalații:" followed by a few bullet/dash items that are themselves plain
+descriptive sentences with NO per-item identifier, code, quantity, or
+rating attached (e.g. "- Completarea și extinderea instalației de
+împământare;", "- Instalație de paratrăsnet pentru protecția silozului de
+grâu."). This is regular body text describing what will be done, not
+itemized technical data - skip it even if bulleted/dashed and even if it
+mentions installations by name, UNLESS each item also carries its own
+concrete identifier or measured value (equipment code, kW/kVAR/m/A rating,
+quantity) the way the TE402/TE403 example above does.
+
 By contrast, DO include a bulleted/arrow list (e.g. using ">", "-", or no
 marker at all) where each item names a project equipment/tablou by its own
 code followed by an installed rating, such as:
@@ -184,14 +208,14 @@ code followed by an installed rating, such as:
   > TE403 și TFC modificat și completat ... 121 kW
 This is a genuine itemized technical list (equipment code + kW rating per
 item) even though it's short and has no visible numbering - extract it as
-kind "list".
+kind "list", category "TEHNIC".
 
 A genuine grid needs at least {min_cols} columns and at least {min_rows}
 rows of short, structured data values below the header. A genuine itemized
 list needs at least {min_rows} qualifying items.
 
 Return ONLY valid JSON, no markdown fences, no commentary:
-{{"tables": [{{"kind": "grid", "title": "EXACT HEADING", "headers": ["Col 1", "Col 2"], "identifier_headers": ["Col 1"], "estimated_data_rows": 5}}]}}
+{{"tables": [{{"kind": "grid", "title": "EXACT HEADING", "headers": ["Col 1", "Col 2"], "identifier_headers": ["Col 1"], "category": "TEHNIC", "estimated_data_rows": 5}}]}}
 
 If this page contains no genuine table or itemized list, return: {{"tables": []}}
 """.format(min_cols=MIN_TABLE_COLUMNS, min_rows=MIN_DATA_ROWS)
@@ -334,9 +358,6 @@ def strip_diacritics(text: str) -> str:
 
 
 def is_title_block(title: str, headers: List[str]):
-    """Detecteaza deterministic un title-block/stampila, care structural poate arata ca un tabel
-    mic dar nu contine date tehnice.
-    """
     joined = strip_diacritics((title + " " + " ".join(headers)).lower())
     hits = sum(1 for kw in TITLE_BLOCK_KEYWORDS if strip_diacritics(kw) in joined)
     return hits >= 2
@@ -446,7 +467,7 @@ def extract_tables_from_page(page_image: bytes, api_key: str, model: str = "meta
         if isinstance(t.get("headers"), list)
            and len([h for h in t["headers"] if h and h.strip()]) >= MIN_TABLE_COLUMNS
            and (t.get("estimated_data_rows") or 0) >= MIN_DATA_ROWS
-           and not is_title_block(t.get("title") or "", [h for h in t["headers"] if h and h.strip()])
+           and str(t.get("category", "TEHNIC")).strip().upper() != "ADMINISTRATIV"
            and not is_toc(t.get("title") or "", [h for h in t["headers"] if h and h.strip()])
     ]
 
@@ -490,8 +511,7 @@ def extract_tables_from_page(page_image: bytes, api_key: str, model: str = "meta
 
 
 
-            if len(clean_rows) >= MIN_DATA_ROWS and not is_title_block(title, ["Nr.", "Descriere"]) and not is_toc(
-                    title, ["Nr.", "Descriere"]):
+            if len(clean_rows) >= MIN_DATA_ROWS and not is_toc(title, ["Nr.", "Descriere"]):
                 if looks_like_toc_content(["Nr.", "Descriere"], clean_rows):
                     print(f"Skipping TOC-like list: {title}")
                     continue
@@ -574,7 +594,7 @@ def extract_tables_from_page(page_image: bytes, api_key: str, model: str = "meta
             continue
 
 
-        if (len(clean_rows) >= MIN_DATA_ROWS and not looks_like_prose and not is_title_block(title, headers)):
+        if (len(clean_rows) >= MIN_DATA_ROWS and not looks_like_prose):
             has_section = any(SECTION_KEY in r for r in clean_rows)
             final_headers = ([SECTION_KEY] if has_section else []) + headers
             results.append({"title": title, "headers": final_headers, "rows": clean_rows, "kind": kind})
